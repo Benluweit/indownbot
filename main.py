@@ -12,9 +12,10 @@ from telegram.ext import (
     filters,
     CallbackContext,
     CallbackQueryHandler,
+    JobQueue,
 )
 from telegram.error import BadRequest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Enable logging
 logging.basicConfig(
@@ -28,7 +29,6 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_USERNAME = "@indown_channel"  # Change to your channel
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
-
 
 # Regex patterns for supported platforms
 INSTAGRAM_REGEX = r"(https?:\/\/www\.instagram\.com\/(?:p|reel|tv|stories)\/[^\s]+)"
@@ -46,17 +46,31 @@ L = instaloader.Instaloader(
 # Command handler for /start
 async def start(update: Update, context: CallbackContext):
     try:
-        keyboard = [
-            [InlineKeyboardButton("📢 Subscribe", url="https://t.me/+RL-78Y_Y188wM2Jh")],
-            [InlineKeyboardButton("✅ Verify Subscription", callback_data="verify_sub")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        start_message = "Send me a valid Instagram, TikTok, or Twitter video link, and I will send you the video. Please verify your subscription to use the bot."
-        await update.message.reply_text(start_message, reply_markup=reply_markup)
+        user_id = update.message.from_user.id
+        
+        # Check if user needs to verify subscription
+        if not context.user_data.get(user_id, {}).get("verified", False):
+            await show_subscription_buttons(update, context)
+        else:
+            await update.message.reply_text("You're already verified! Send me a link to download content.")
     except Exception as e:
         logger.error(f"Error in start command: {e}")
         await update.message.reply_text("An error occurred. Please try again later.")
+
+# Show subscription buttons
+async def show_subscription_buttons(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("📢 Subscribe", url="https://t.me/+RL-78Y_Y188wM2Jh")],
+        [InlineKeyboardButton("✅ Verify Subscription", callback_data="verify_sub")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    start_message = "Send me a valid Instagram, TikTok, or Twitter video link, and I will send you the video. Please verify your subscription to use the bot."
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(start_message, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(start_message, reply_markup=reply_markup)
 
 # Check if user is subscribed
 async def is_user_subscribed(user_id: int, context: CallbackContext) -> bool:
@@ -70,15 +84,48 @@ async def is_user_subscribed(user_id: int, context: CallbackContext) -> bool:
 # Verify subscription callback
 async def handle_verify_subscription(update: Update, context: CallbackContext):
     query = update.callback_query
+    await query.answer()
     user_id = query.from_user.id
 
     if await is_user_subscribed(user_id, context):
-        await query.answer("✅ You are subscribed! You can now use the bot.")
+        # Store verification with timestamp
+        context.user_data[user_id] = {
+            "verified": True,
+            "verified_at": datetime.now().timestamp()
+        }
+        
+        # Schedule verification reset after 24 hours
+        context.job_queue.run_once(
+            reset_verification,
+            when=timedelta(hours=24),
+            user_id=user_id
+        )
+        
         await query.edit_message_text("✅ You are subscribed! You can now use the bot.")
-        context.user_data[user_id] = {"verified": True}
     else:
         await query.answer("❌ You are not subscribed. Please subscribe first.")
         await verif_message(update, context)
+
+# Reset verification status after 24 hours
+async def reset_verification(context: CallbackContext):
+    job = context.job
+    user_id = job.user_id
+    
+    if user_id in context.user_data:
+        context.user_data[user_id]["verified"] = False
+        del context.user_data[user_id]["verified_at"]
+        
+        try:
+            await context.bot.send_message(
+                user_id,
+                "🔔 Your subscription verification has expired. Please verify your subscription again to continue using the bot.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📢 Subscribe", url="https://t.me/+RL-78Y_Y188wM2Jh")],
+                    [InlineKeyboardButton("✅ Verify Subscription", callback_data="verify_sub")],
+                ])
+            )
+        except Exception as e:
+            logger.error(f"Error sending verification reset message: {e}")
 
 # Verification message
 async def verif_message(update: Update, context: CallbackContext):
